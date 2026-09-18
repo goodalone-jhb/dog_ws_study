@@ -26,15 +26,18 @@ JOINT_NAMES = [
     'RR_hip_joint',   'RR_thigh_joint', 'RR_calf_joint',
 ]
 
-# ===== 当前只接了一条后腿 =====
-# 如果你接的是 RL，改成 'RL'；如果是 RR，改成 'RR'
-ACTIVE_LEG = 'RL'
+# ===== 关节顺序：FL(0,1,2) FR(3,4,5) RL(6,7,8) RR(9,10,11) =====
 LEG_INDEX = {
     'RL': [6, 7, 8],
     'RR': [9, 10, 11],
 }
 
-CAN_CHANNEL = 'can2'
+# ===== 接了哪几条腿：每条腿各占一条 CAN 总线 =====
+# 每条总线都是独立的一网，所以三台电机的 ID 都是 1/2/3 也不冲突
+LEGS = [
+    {'name': 'RL', 'channel': 'can2', 'indices': LEG_INDEX['RL']},
+    {'name': 'RR', 'channel': 'can1', 'indices': LEG_INDEX['RR']},
+]
 MOTOR_IDS = [1, 2, 3]
 
 
@@ -98,14 +101,14 @@ def send_special(bus, motor_id, cmd):
 
 
 class FeedbackListener(can.Listener):
-    """CAN 收帧回调：只解析，把结果写进 node.state。
+    """CAN 收帧回调：只解析，把结果写进 leg.state。
 
     Notifier 在它自己的线程里调用 on_message_received，
     所以这里绝不碰 ROS 发布器；ROS 发送统一在 publish_state 定时器里做。
     """
 
-    def __init__(self, node):
-        self.node = node
+    def __init__(self, leg):
+        self.leg = leg
 
     def on_message_received(self, msg):
         # 只要电机的反馈帧：ID=0x00 且 6 字节。
@@ -115,29 +118,59 @@ class FeedbackListener(can.Listener):
         motor_id = msg.data[0]
         if motor_id not in MOTOR_IDS:
             return
-        self.node.state[motor_id] = decode_feedback(msg.data)
+        self.leg.state[motor_id] = decode_feedback(msg.data)
+
+
+class Leg:
+    """一条腿 = 一条 CAN 总线 + 3 台电机 + 3 个关节索引 + 自己的反馈缓存。
+
+    把"每条腿各自的东西"都收在这里，节点就只用遍历 LEGS，不用到处写死。
+    """
+
+    def __init__(self, name, channel, indices):
+        self.name = name
+        self.indices = indices                            # 本腿在 /joint_command 里的 3 个索引
+        self.bus = can.interface.Bus(channel=channel, interface='socketcan')
+        self.state = {}                                   # motor_id -> (位置, 速度, 力矩)
+        self.notifier = None                              # 收帧线程，由节点创建
+
+    def enable(self):
+        for mid in MOTOR_IDS:
+            send_special(self.bus, mid, 0xFC)
+
+    def disable(self):
+        for mid in MOTOR_IDS:
+            try:
+                send_special(self.bus, mid, 0xFD)
+            except Exception:
+                pass
+
+    def send_command(self, data):
+        """data 是完整的 12 个关节目标；本腿只取自己那 3 个，发给自己的 3 台电机。"""
+        for mid, idx in zip(MOTOR_IDS, self.indices):
+            self.bus.send(can.Message(
+                arbitration_id=mid,
+                data=pack_cmd(data[idx], 0.0, KP, KD, 0.0),
+                is_extended_id=False
+            ))
 
 
 class DamiaoDriver(Node):
     def __init__(self):
         super().__init__('damiao_driver')
 
-        self.bus = can.interface.Bus(channel=CAN_CHANNEL, interface='socketcan')
-        self.get_logger().info(f'已连接 {CAN_CHANNEL}')
+        # ===== 每条腿：开自己的总线 → 起自己的收帧线程 → 使能自己的 3 台电机 =====
+        self.legs = []
+        for cfg in LEGS:
+            leg = Leg(cfg['name'], cfg['channel'], cfg['indices'])
+            leg.notifier = can.Notifier(leg.bus, [FeedbackListener(leg)])
+            leg.enable()
+            self.legs.append(leg)
+            self.get_logger().info(f"{leg.name} 腿：{cfg['channel']} 已连接并使能")
 
-        # 使能当前腿的 3 个电机
-        for mid in MOTOR_IDS:
-            send_special(self.bus, mid, 0xFC)
-        self.get_logger().info(f'{ACTIVE_LEG} 腿电机已使能')
-
-        # ===== 接收反馈：Notifier 起后台线程，收到帧就交给 FeedbackListener =====
-        self.state = {}                       # motor_id -> (位置, 速度, 力矩)
-        self.listener = FeedbackListener(self)
-        self.notifier = can.Notifier(self.bus, [self.listener])
-
-        # ===== 把真实反馈发到 /joint_states（闭环要用它，RViz 也用它）=====
+        # ===== 两条腿的反馈合起来发到 /joint_states（闭环要用它，RViz 也用它）=====
         self.state_pub = self.create_publisher(JointState, '/joint_states', 10)
-        self.state_timer = self.create_timer(0.02, self.publish_state)   # 50 Hz，与电机回帧同频
+        self.state_timer = self.create_timer(0.02, self.publish_state)   # 50 Hz
 
         self.sub = self.create_subscription(
             Float64MultiArray,
@@ -151,48 +184,38 @@ class DamiaoDriver(Node):
             self.get_logger().warn(f'收到 {len(msg.data)} 个数据，期望 12 个')
             return
 
-        indices = LEG_INDEX[ACTIVE_LEG]
-        for motor_id, idx in zip(MOTOR_IDS, indices):
-            pos = msg.data[idx]
-            self.bus.send(can.Message(
-                arbitration_id=motor_id,
-                data=pack_cmd(pos, 0.0, KP, KD, 0.0),
-                is_extended_id=False
-            ))
+        for leg in self.legs:
+            leg.send_command(msg.data)
 
     def publish_state(self):
-        """把最近收到的反馈发成一帧 JointState（只发这条腿上真实存在的 3 个关节）。"""
-        indices = LEG_INDEX[ACTIVE_LEG]
-
+        """把两条腿最近收到的反馈合成一帧 JointState（没收到反馈的关节就不发）。"""
         js = JointState()
         js.header.stamp = self.get_clock().now().to_msg()
 
-        for motor_id, idx in zip(MOTOR_IDS, indices):
-            if motor_id not in self.state:      # 还没收到这台的反馈，这轮先跳过它
-                continue
-            pos, vel, tau = self.state[motor_id]
-            js.name.append(JOINT_NAMES[idx])
-            js.position.append(pos)
-            js.velocity.append(vel)
-            js.effort.append(tau)
+        for leg in self.legs:
+            for motor_id, idx in zip(MOTOR_IDS, leg.indices):
+                if motor_id not in leg.state:   # 还没收到这台的反馈，这轮跳过它
+                    continue
+                pos, vel, tau = leg.state[motor_id]
+                js.name.append(JOINT_NAMES[idx])
+                js.position.append(pos)
+                js.velocity.append(vel)
+                js.effort.append(tau)
 
         if js.name:                             # 一台都没收到就不发空消息
             self.state_pub.publish(js)
 
     def shutdown(self):
-        try:
-            self.notifier.stop()                # 先停收帧线程
-        except Exception:
-            pass
-        for mid in MOTOR_IDS:
+        for leg in self.legs:
             try:
-                send_special(self.bus, mid, 0xFD)
+                leg.notifier.stop()             # 先停收帧线程
             except Exception:
                 pass
-        try:
-            self.bus.shutdown()
-        except Exception:
-            pass
+            leg.disable()                        # 再失能
+            try:
+                leg.bus.shutdown()
+            except Exception:
+                pass
 
 
 def main(args=None):

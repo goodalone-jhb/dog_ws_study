@@ -25,6 +25,9 @@ setup(
     entry_points={
         'console_scripts': [
 		'joint_command_publisher = dog_control.joint_command_publisher:main',
+        'joint_command_bridge = dog_control.joint_command_bridge:main',
+        'stand_controller = dog_control.stand_controller:main',
+        'damiao_driver = dog_control.damiao_driver:main',
         ],
     },
 )
